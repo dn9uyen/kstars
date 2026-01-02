@@ -21,6 +21,13 @@ jobs:
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_ANALYTICS: "1"
 
+      # Fix Boost config-mode breakage on newer CMake + avoid unit-test component config.
+      # (Keep as semicolon-separated; Craft treats args as a list.)
+      KSTARS_CRAFT_ARGS: >-
+        -DBUILD_TESTING=OFF;
+        -DBoost_NO_BOOST_CMAKE=ON;
+        -DCMAKE_POLICY_DEFAULT_CMP0167=OLD
+
     steps:
       - name: Checkout (your fork)
         uses: actions/checkout@v4
@@ -57,15 +64,12 @@ jobs:
 
           rm -rf "$CRAFT_PREFIX"
           mkdir -p "$CRAFT_PREFIX" "$CRAFT_DOWNLOAD_CACHE"
-
-          # Make Craft use the cached download directory
           ln -sfn "$CRAFT_DOWNLOAD_CACHE" "$CRAFT_PREFIX/download"
 
           curl -L "https://raw.githubusercontent.com/KDE/craft/${CRAFT_BRANCH}/setup/CraftBootstrap.py" -o setup.py
-          # macOS prompt: [0] x86_64, [1] arm64 -> choose 1, then accept defaults.
           printf "1\n\n" | "$VENV_PY" setup.py --prefix "$CRAFT_PREFIX" --branch "$CRAFT_BRANCH"
 
-      - name: Sanity check Craft configuration (macOS ABI + cache enabled)
+      - name: Sanity check Craft configuration (macOS ABI + non-Homebrew Python)
         run: |
           set -euxo pipefail
           SETTINGS="$CRAFT_PREFIX/etc/CraftSettings.ini"
@@ -78,14 +82,14 @@ jobs:
             exit 1
           fi
 
-          echo "---- UseCache ----"
-          # Many Craft setups default to cache; this confirms we didn't disable it.
-          if grep -qE '^\s*UseCache\s*=\s*False\b' "$SETTINGS"; then
-            echo "ERROR: UseCache is False (would force source builds)."
+          echo "---- Paths/Python ----"
+          awk 'BEGIN{p=0} /^\[Paths\]/{p=1} p{print} /^\[/{if(p && $0!="[Paths]") exit}' "$SETTINGS" || true
+          if grep -qE '^\s*Python\s*=\s*/opt/homebrew' "$SETTINGS"; then
+            echo "ERROR: Craft is configured to use Homebrew Python (externally-managed)."
             exit 1
           fi
 
-      - name: Build KStars from this repo checkout (keep cache ON, disable tests)
+      - name: Build KStars from this repo checkout (USE CACHE, no forced rebuild)
         run: |
           set -euxo pipefail
           unset ANDROID_SDK_ROOT ANDROID_HOME
@@ -94,27 +98,23 @@ jobs:
           source "$CRAFT_PREFIX/craft/craftenv.sh"
           set -u
 
-          # Resolve the Craft package name (varies by blueprint repo/branch)
-          PKG="kstars"
-          if craft --search kstars | grep -qiE 'kde/applications/kstars'; then
-            PKG="kde/applications/kstars"
-          elif craft --search kstars | grep -qiE 'kde/education/kstars'; then
+          if craft --search kstars | grep -qiE 'kde/education/kstars'; then
             PKG="kde/education/kstars"
+          else
+            PKG="kstars"
           fi
           echo "Using Craft package: $PKG"
 
           # IMPORTANT:
-          # - Do NOT use --no-cache (forces LLVM/Qt/etc from source; slow + triggers msgfmt crash path)
-          # - Do NOT use --ignoreInstalled (can rebuild deps unnecessarily)
-          #
-          # Also: pass CMake args as a *space-separated* string (not semicolon-separated).
+          # - NO --no-cache (it disables prebuilt binaries)
+          # - NO --ignoreInstalled (it forces rebuilds)
           craft \
             --options "$PKG.srcDir=$GITHUB_WORKSPACE" \
             --options "$PKG.buildTests=False" \
-            --options "$PKG.configure.args=-DBUILD_TESTING=OFF -DBoost_NO_BOOST_CMAKE=ON" \
+            --options "$PKG.args=$KSTARS_CRAFT_ARGS" \
             "$PKG"
 
-      - name: Package DMG (no rebuild, same options)
+      - name: Package DMG
         run: |
           set -euxo pipefail
           unset ANDROID_SDK_ROOT ANDROID_HOME
@@ -123,18 +123,16 @@ jobs:
           source "$CRAFT_PREFIX/craft/craftenv.sh"
           set -u
 
-          PKG="kstars"
-          if craft --search kstars | grep -qiE 'kde/applications/kstars'; then
-            PKG="kde/applications/kstars"
-          elif craft --search kstars | grep -qiE 'kde/education/kstars'; then
+          if craft --search kstars | grep -qiE 'kde/education/kstars'; then
             PKG="kde/education/kstars"
+          else
+            PKG="kstars"
           fi
-          echo "Using Craft package: $PKG"
 
           craft \
             --options "$PKG.srcDir=$GITHUB_WORKSPACE" \
             --options "$PKG.buildTests=False" \
-            --options "$PKG.configure.args=-DBUILD_TESTING=OFF -DBoost_NO_BOOST_CMAKE=ON" \
+            --options "$PKG.args=$KSTARS_CRAFT_ARGS" \
             --package "$PKG"
 
       - name: Collect artifacts
