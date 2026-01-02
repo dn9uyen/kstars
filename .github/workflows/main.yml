@@ -32,10 +32,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Create a venv for Craft bootstrap
+      - name: Create venv for Craft bootstrap
         run: |
           set -euxo pipefail
-          python -V
           python -m venv "$GITHUB_WORKSPACE/.craft-bootstrap-venv"
           echo "VENV_PY=$GITHUB_WORKSPACE/.craft-bootstrap-venv/bin/python" >> "$GITHUB_ENV"
           "$GITHUB_WORKSPACE/.craft-bootstrap-venv/bin/python" -m pip install -U pip
@@ -44,41 +43,48 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.CRAFT_PREFIX }}/download
-          key: macos-arm64-craft-${{ env.CRAFT_BRANCH }}-download-v3
+          key: macos-arm64-craft-${{ env.CRAFT_BRANCH }}-download-v4
           restore-keys: |
             macos-arm64-craft-${{ env.CRAFT_BRANCH }}-download-
 
-      - name: Bootstrap KDE Craft (arm64)
+      - name: Bootstrap KDE Craft (force macOS, select arm64)
         run: |
           set -euxo pipefail
+
+          # IMPORTANT: CraftBootstrap enters Android mode if ANDROID_SDK_ROOT is set. :contentReference[oaicite:1]{index=1}
+          unset ANDROID_SDK_ROOT ANDROID_HOME
+
+          # Ensure we don't reuse a previously misconfigured prefix (android ABI etc.)
+          rm -rf "$CRAFT_PREFIX"
           mkdir -p "$CRAFT_PREFIX"
 
           curl -L "https://raw.githubusercontent.com/KDE/craft/${CRAFT_BRANCH}/setup/CraftBootstrap.py" -o setup.py
 
-          # Prompt sequence on macOS includes target arch; choose arm64 (index 1),
-          # then accept defaults for the rest.
-          printf "1\n\n\n\n" | "$VENV_PY" setup.py --prefix "$CRAFT_PREFIX" --branch "$CRAFT_BRANCH"
+          # macOS prompt: Select target architecture ["x86_64", "arm64"] (default x86_64). :contentReference[oaicite:2]{index=2}
+          # Then colored logs prompt (default Yes) -> empty line accepts default.
+          printf "1\n\n" | "$VENV_PY" setup.py --prefix "$CRAFT_PREFIX" --branch "$CRAFT_BRANCH"
 
-      - name: Sanity-check Craft is NOT using Homebrew Python
+      - name: Sanity check ABI is macOS arm64
         run: |
           set -euxo pipefail
           SETTINGS="$CRAFT_PREFIX/etc/CraftSettings.ini"
           test -f "$SETTINGS"
-          echo "---- CraftSettings.ini (Paths section excerpt) ----"
-          awk 'BEGIN{p=0} /^\[Paths\]/{p=1} p==1{print} /^\[/{if($0!="[Paths]") exit}' "$SETTINGS" || true
-
-          # Fail fast if CraftSettings points at /opt/homebrew (the PEP 668 trouble spot)
-          if grep -qE '^\s*Python\s*=\s*/opt/homebrew' "$SETTINGS"; then
-            echo "Craft is configured to use Homebrew Python (externally-managed)."
+          echo "---- ABI from CraftSettings.ini ----"
+          grep -E '^\s*ABI\s*=' "$SETTINGS" || true
+          # Must be macos-clang-arm64 (or at least start with macos-)
+          if ! grep -qE '^\s*ABI\s*=\s*macos-' "$SETTINGS"; then
+            echo "ERROR: Craft ABI is not macOS. Full ABI line:"
+            grep -E '^\s*ABI\s*=' "$SETTINGS" || true
             exit 1
           fi
 
       - name: Build KStars from this repo checkout
         run: |
           set -euxo pipefail
+          unset ANDROID_SDK_ROOT ANDROID_HOME
+
           source "$CRAFT_PREFIX/craft/craftenv.sh"
 
-          # Choose blueprint name
           if craft --search kstars | grep -qiE 'kde/education/kstars'; then
             PKG="kde/education/kstars"
           else
@@ -90,6 +96,8 @@ jobs:
       - name: Package DMG
         run: |
           set -euxo pipefail
+          unset ANDROID_SDK_ROOT ANDROID_HOME
+
           source "$CRAFT_PREFIX/craft/craftenv.sh"
 
           if craft --search kstars | grep -qiE 'kde/education/kstars'; then
@@ -105,6 +113,7 @@ jobs:
           set -euxo pipefail
           mkdir -p artifacts
           find "$CRAFT_PREFIX/tmp" -maxdepth 2 -name "*.dmg" -print -exec cp -v {} artifacts/ \; || true
+          cp -v "$CRAFT_PREFIX/etc/CraftSettings.ini" artifacts/ || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
