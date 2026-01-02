@@ -8,9 +8,17 @@ on:
 jobs:
   build:
     runs-on: macos-14
+    timeout-minutes: 180
+
+    defaults:
+      run:
+        shell: bash
+
     env:
       CRAFT_PREFIX: ${{ github.workspace }}/.craftroot
       CRAFT_BRANCH: master
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
 
     steps:
       - name: Checkout (your fork)
@@ -19,27 +27,58 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
+      - name: Setup Python (toolcache)
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Create a venv for Craft bootstrap
+        run: |
+          set -euxo pipefail
+          python -V
+          python -m venv "$GITHUB_WORKSPACE/.craft-bootstrap-venv"
+          echo "VENV_PY=$GITHUB_WORKSPACE/.craft-bootstrap-venv/bin/python" >> "$GITHUB_ENV"
+          "$GITHUB_WORKSPACE/.craft-bootstrap-venv/bin/python" -m pip install -U pip
+
       - name: Cache Craft downloads
         uses: actions/cache@v4
         with:
           path: ${{ env.CRAFT_PREFIX }}/download
-          key: macos-arm64-craft-${{ env.CRAFT_BRANCH }}-download-v1
+          key: macos-arm64-craft-${{ env.CRAFT_BRANCH }}-download-v3
           restore-keys: |
             macos-arm64-craft-${{ env.CRAFT_BRANCH }}-download-
 
-      - name: Bootstrap KDE Craft (select arm64)
+      - name: Bootstrap KDE Craft (arm64)
         run: |
           set -euxo pipefail
           mkdir -p "$CRAFT_PREFIX"
+
           curl -L "https://raw.githubusercontent.com/KDE/craft/${CRAFT_BRANCH}/setup/CraftBootstrap.py" -o setup.py
-          printf "1\n\n" | python3 setup.py --prefix "$CRAFT_PREFIX" --branch "$CRAFT_BRANCH"
+
+          # Prompt sequence on macOS includes target arch; choose arm64 (index 1),
+          # then accept defaults for the rest.
+          printf "1\n\n\n\n" | "$VENV_PY" setup.py --prefix "$CRAFT_PREFIX" --branch "$CRAFT_BRANCH"
+
+      - name: Sanity-check Craft is NOT using Homebrew Python
+        run: |
+          set -euxo pipefail
+          SETTINGS="$CRAFT_PREFIX/etc/CraftSettings.ini"
+          test -f "$SETTINGS"
+          echo "---- CraftSettings.ini (Paths section excerpt) ----"
+          awk 'BEGIN{p=0} /^\[Paths\]/{p=1} p==1{print} /^\[/{if($0!="[Paths]") exit}' "$SETTINGS" || true
+
+          # Fail fast if CraftSettings points at /opt/homebrew (the PEP 668 trouble spot)
+          if grep -qE '^\s*Python\s*=\s*/opt/homebrew' "$SETTINGS"; then
+            echo "Craft is configured to use Homebrew Python (externally-managed)."
+            exit 1
+          fi
 
       - name: Build KStars from this repo checkout
         run: |
           set -euxo pipefail
           source "$CRAFT_PREFIX/craft/craftenv.sh"
 
-          # Pick the blueprint name Craft exposes
+          # Choose blueprint name
           if craft --search kstars | grep -qiE 'kde/education/kstars'; then
             PKG="kde/education/kstars"
           else
@@ -65,7 +104,7 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p artifacts
-          find "$CRAFT_PREFIX/tmp" -maxdepth 2 -name "*.dmg" -print -exec cp -v {} artifacts/ \;
+          find "$CRAFT_PREFIX/tmp" -maxdepth 2 -name "*.dmg" -print -exec cp -v {} artifacts/ \; || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
