@@ -28,12 +28,6 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      # Optional: helps if your fork/checkout is missing tags and something calls `git describe`
-      - name: Fetch tags (optional)
-        run: |
-          set -euxo pipefail
-          git fetch --force --tags || true
-
       - name: Setup Python (toolcache)
         uses: actions/setup-python@v6
         with:
@@ -58,15 +52,12 @@ jobs:
       - name: Bootstrap KDE Craft (force macOS, select arm64)
         run: |
           set -euxo pipefail
-          # Prevent CraftBootstrap from switching to Android mode on GitHub runners.
           unset ANDROID_SDK_ROOT ANDROID_HOME
-          # Fresh prefix (won't wipe download cache since it's stored outside prefix)
           rm -rf "$CRAFT_PREFIX"
           mkdir -p "$CRAFT_PREFIX" "$CRAFT_DOWNLOAD_CACHE"
-          # Make Craft use the cached download directory
           ln -sfn "$CRAFT_DOWNLOAD_CACHE" "$CRAFT_PREFIX/download"
           curl -L "https://raw.githubusercontent.com/KDE/craft/${CRAFT_BRANCH}/setup/CraftBootstrap.py" -o setup.py
-          # macOS prompt: [0] x86_64, [1] arm64 -> choose 1, then accept defaults.
+          # macOS prompt: [0] x86_64, [1] arm64 -> choose 1
           printf "1\n\n" | "$VENV_PY" setup.py --prefix "$CRAFT_PREFIX" --branch "$CRAFT_BRANCH"
 
       - name: Sanity check Craft configuration (macOS ABI + non-Homebrew Python)
@@ -91,25 +82,33 @@ jobs:
         run: |
           set -euxo pipefail
           unset ANDROID_SDK_ROOT ANDROID_HOME
+
           # craftenv.sh is not nounset-safe
           set +u
           source "$CRAFT_PREFIX/craft/craftenv.sh"
           set -u
 
-          if craft --search kstars | grep -qiE 'kde/education/kstars'; then
+          # Prefer the real blueprint path if present
+          if craft --search kstars | grep -qiE 'kde/applications/kstars'; then
+            PKG="kde/applications/kstars"
+          elif craft --search kstars | grep -qiE 'kde/education/kstars'; then
             PKG="kde/education/kstars"
           else
             PKG="kstars"
           fi
           echo "Using Craft package: $PKG"
 
-          craft --ignoreInstalled \
-            --options "$PKG.srcDir=$GITHUB_WORKSPACE" \
-            --options "$PKG.buildTests=False" \
-            --options "$PKG.args=-DBoost_NO_BOOST_CMAKE=ON" \
-            "$PKG"
+          # Fix: tests pull in Boost unit_test_framework which Craft's Boost may not provide
+          # Force tests OFF at CMake level + avoid Boost's CMake config component lookup
+          craft_opts=(
+            --options "$PKG.srcDir=$GITHUB_WORKSPACE"
+            --options "$PKG.buildTests=False"
+            --options "$PKG.args=-DBUILD_TESTING=OFF;-DBoost_NO_BOOST_CMAKE=ON"
+          )
 
-      - name: Package DMG (disable tests)
+          craft --ignoreInstalled --no-cache "${craft_opts[@]}" "$PKG"
+
+      - name: Package DMG
         run: |
           set -euxo pipefail
           unset ANDROID_SDK_ROOT ANDROID_HOME
@@ -117,17 +116,22 @@ jobs:
           source "$CRAFT_PREFIX/craft/craftenv.sh"
           set -u
 
-          if craft --search kstars | grep -qiE 'kde/education/kstars'; then
+          if craft --search kstars | grep -qiE 'kde/applications/kstars'; then
+            PKG="kde/applications/kstars"
+          elif craft --search kstars | grep -qiE 'kde/education/kstars'; then
             PKG="kde/education/kstars"
           else
             PKG="kstars"
           fi
+          echo "Using Craft package: $PKG"
 
-          craft \
-            --options "$PKG.srcDir=$GITHUB_WORKSPACE" \
-            --options "$PKG.buildTests=False" \
-            --options "$PKG.args=-DBoost_NO_BOOST_CMAKE=ON" \
-            --package "$PKG"
+          craft_opts=(
+            --options "$PKG.srcDir=$GITHUB_WORKSPACE"
+            --options "$PKG.buildTests=False"
+            --options "$PKG.args=-DBUILD_TESTING=OFF;-DBoost_NO_BOOST_CMAKE=ON"
+          )
+
+          craft --package "${craft_opts[@]}" "$PKG"
 
       - name: Collect artifacts
         run: |
