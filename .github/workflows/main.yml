@@ -5,6 +5,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: kstars-macos-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: macos-14
@@ -26,6 +30,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          fetch-tags: true
           submodules: recursive
 
       - name: Setup Python (toolcache)
@@ -45,7 +50,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.CRAFT_DOWNLOAD_CACHE }}
-          key: macos-arm64-craft-${{ env.CRAFT_BRANCH }}-download-v6
+          key: macos-arm64-craft-${{ env.CRAFT_BRANCH }}-download-v7
           restore-keys: |
             macos-arm64-craft-${{ env.CRAFT_BRANCH }}-download-
 
@@ -59,17 +64,51 @@ jobs:
           ln -sfn "$CRAFT_DOWNLOAD_CACHE" "$CRAFT_PREFIX/download"
 
           curl -L "https://raw.githubusercontent.com/KDE/craft/${CRAFT_BRANCH}/setup/CraftBootstrap.py" -o setup.py
-
           # macOS prompt: [0] x86_64, [1] arm64 -> choose 1
-          # then "colored logs" prompt -> accept default with blank line
           printf "1\n\n" | "$VENV_PY" setup.py --prefix "$CRAFT_PREFIX" --branch "$CRAFT_BRANCH"
 
-      - name: Sanity check Craft configuration (ABI + cache repo + Python)
+      - name: Patch CraftSettings.ini (disable tests + force binary cache)
         run: |
           set -euxo pipefail
           SETTINGS="$CRAFT_PREFIX/etc/CraftSettings.ini"
           test -f "$SETTINGS"
 
+          python - <<'PY'
+          import re, os, pathlib
+
+          p = pathlib.Path(os.environ["CRAFT_PREFIX"]) / "etc" / "CraftSettings.ini"
+          s = p.read_text()
+
+          def set_in_section(text, section, key, value):
+            # Ensure section exists
+            if not re.search(rf"(?m)^\[{re.escape(section)}\]\s*$", text):
+              text += f"\n[{section}]\n"
+            # Insert or replace key in section
+            sec_re = re.compile(rf"(?ms)^\[{re.escape(section)}\]\s*$.*?(?=^\[|\Z)")
+            m = sec_re.search(text)
+            block = m.group(0)
+
+            key_re = re.compile(rf"(?m)^\s*{re.escape(key)}\s*=\s*.*$")
+            if key_re.search(block):
+              block2 = key_re.sub(f"{key} = {value}", block)
+            else:
+              # Insert after section header line
+              lines = block.splitlines()
+              lines.insert(1, f"{key} = {value}")
+              block2 = "\n".join(lines) + ("\n" if not block.endswith("\n") else "")
+            return text[:m.start()] + block2 + text[m.end():]
+
+          s = set_in_section(s, "Compile", "BuildTests", "False")
+          s = set_in_section(s, "Packager", "UseCache", "True")
+
+          p.write_text(s)
+          print("Patched", p)
+          PY
+
+      - name: Sanity check Craft configuration (ABI + BuildTests OFF + UseCache ON)
+        run: |
+          set -euxo pipefail
+          SETTINGS="$CRAFT_PREFIX/etc/CraftSettings.ini"
           echo "---- ABI ----"
           grep -E '^\s*ABI\s*=' "$SETTINGS" || true
           if ! grep -qE '^\s*ABI\s*=\s*macos-' "$SETTINGS"; then
@@ -77,21 +116,21 @@ jobs:
             exit 1
           fi
 
-          echo "---- Packager/RepositoryUrl (binary cache) ----"
+          echo "---- Compile ----"
+          awk 'BEGIN{p=0} /^\[Compile\]/{p=1} p{print} /^\[/{if(p && $0!="[Compile]") exit}' "$SETTINGS" || true
+          if ! grep -qE '^\s*BuildTests\s*=\s*False\b' "$SETTINGS"; then
+            echo "ERROR: BuildTests is not False (would trigger Boost.Test failures)."
+            exit 1
+          fi
+
+          echo "---- Packager ----"
           awk 'BEGIN{p=0} /^\[Packager\]/{p=1} p{print} /^\[/{if(p && $0!="[Packager]") exit}' "$SETTINGS" || true
-          if ! grep -qE '^\s*RepositoryUrl\s*=\s*https?://.+' "$SETTINGS"; then
-            echo "ERROR: RepositoryUrl is missing -> Craft may build EVERYTHING from source."
+          if ! grep -qE '^\s*UseCache\s*=\s*True\b' "$SETTINGS"; then
+            echo "ERROR: UseCache is not True (could cause 2h source builds)."
             exit 1
           fi
 
-          echo "---- Paths/Python ----"
-          awk 'BEGIN{p=0} /^\[Paths\]/{p=1} p{print} /^\[/{if(p && $0!="[Paths]") exit}' "$SETTINGS" || true
-          if grep -qE '^\s*Python\s*=\s*/opt/homebrew' "$SETTINGS"; then
-            echo "ERROR: Craft is configured to use Homebrew Python (externally-managed)."
-            exit 1
-          fi
-
-      - name: Preflight: build libftdi with tests OFF (avoids Boost.Test failure)
+      - name: Build KStars from this repo checkout (no forced rebuild)
         run: |
           set -euxo pipefail
           unset ANDROID_SDK_ROOT ANDROID_HOME
@@ -100,54 +139,21 @@ jobs:
           source "$CRAFT_PREFIX/craft/craftenv.sh"
           set -u
 
-          # IMPORTANT:
-          # - Do NOT use --no-cache (that disables Craft's binary cache and causes 2h source builds)
-          # - Disable libftdi tests (they trigger Boost.Test / boost_unit_test_framework)
-          craft \
-            --options "libs/libftdi.buildTests=False" \
-            --options "libs/libftdi.args=-DBUILD_TESTING=OFF;-DBUILD_TESTS=OFF" \
-            libs/libftdi
-
-          # If libftdi was built from source, confirm tests are really OFF.
-          # If it came from the binary cache, this file may not exist (that's fine).
-          cache_file="$(find "$CRAFT_PREFIX/build" -path "*/libs/libftdi/*/build/CMakeCache.txt" -print -quit || true)"
-          if [[ -n "${cache_file}" ]]; then
-            echo "Checking ${cache_file}"
-            grep -qE '^BUILD_TESTING:BOOL=OFF$' "$cache_file"
-            grep -qE '^BUILD_TESTS:BOOL=OFF$' "$cache_file" || true
-          else
-            echo "No libftdi CMakeCache.txt found (likely installed from binary cache) — OK"
-          fi
-
-      - name: Build KStars from this repo checkout
-        run: |
-          set -euxo pipefail
-          unset ANDROID_SDK_ROOT ANDROID_HOME
-
-          set +u
-          source "$CRAFT_PREFIX/craft/craftenv.sh"
-          set -u
-
+          # Resolve package name (blueprint path can vary)
+          PKG="kstars"
           if craft --search kstars | grep -qiE 'kde/applications/kstars'; then
             PKG="kde/applications/kstars"
           elif craft --search kstars | grep -qiE 'kde/education/kstars'; then
             PKG="kde/education/kstars"
-          else
-            PKG="kstars"
           fi
           echo "Using Craft package: $PKG"
 
-          craft_opts=(
-            --options "$PKG.srcDir=$GITHUB_WORKSPACE"
-            --options "$PKG.buildTests=False"
-            --options "libs/libftdi.buildTests=False"
-            --options "libs/libftdi.args=-DBUILD_TESTING=OFF;-DBUILD_TESTS=OFF"
-          )
+          # No --no-cache, no --ignoreInstalled
+          craft \
+            --options "$PKG.srcDir=$GITHUB_WORKSPACE" \
+            "$PKG"
 
-          # NOTE: no --no-cache here (keeps binary cache ON -> avoids 2h compile)
-          craft "${craft_opts[@]}" "$PKG"
-
-      - name: Package DMG
+      - name: Package DMG (should not rebuild)
         run: |
           set -euxo pipefail
           unset ANDROID_SDK_ROOT ANDROID_HOME
@@ -156,22 +162,17 @@ jobs:
           source "$CRAFT_PREFIX/craft/craftenv.sh"
           set -u
 
+          PKG="kstars"
           if craft --search kstars | grep -qiE 'kde/applications/kstars'; then
             PKG="kde/applications/kstars"
           elif craft --search kstars | grep -qiE 'kde/education/kstars'; then
             PKG="kde/education/kstars"
-          else
-            PKG="kstars"
           fi
+          echo "Using Craft package: $PKG"
 
-          craft_opts=(
-            --options "$PKG.srcDir=$GITHUB_WORKSPACE"
-            --options "$PKG.buildTests=False"
-            --options "libs/libftdi.buildTests=False"
-            --options "libs/libftdi.args=-DBUILD_TESTING=OFF;-DBUILD_TESTS=OFF"
-          )
-
-          craft "${craft_opts[@]}" --package "$PKG"
+          craft \
+            --options "$PKG.srcDir=$GITHUB_WORKSPACE" \
+            --package "$PKG"
 
       - name: Collect artifacts
         run: |
