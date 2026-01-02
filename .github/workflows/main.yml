@@ -8,9 +8,8 @@ on:
 jobs:
   build:
     runs-on: macos-14
-
     env:
-      CRAFT_PREFIX: ${{ runner.temp }}/CraftRoot
+      CRAFT_PREFIX: ${{ github.workspace }}/.craftroot
       CRAFT_BRANCH: master
 
     steps:
@@ -20,13 +19,6 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      - name: Verify we are on Apple Silicon
-        run: |
-          set -euxo pipefail
-          uname -m
-          test "$(uname -m)" = "arm64"
-
-      # Optional: cache Craft downloads (saves a lot of time on repeat runs)
       - name: Cache Craft downloads
         uses: actions/cache@v4
         with:
@@ -39,35 +31,21 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p "$CRAFT_PREFIX"
-
           curl -L "https://raw.githubusercontent.com/KDE/craft/${CRAFT_BRANCH}/setup/CraftBootstrap.py" -o setup.py
-
-          # CraftBootstrap prompts on macOS for target architecture:
-          #   [0] x86_64, [1] arm64  (default is x86_64)
-          # We choose "1" (arm64), then accept defaults for later prompts. :contentReference[oaicite:1]{index=1}
           printf "1\n\n" | python3 setup.py --prefix "$CRAFT_PREFIX" --branch "$CRAFT_BRANCH"
-
-      - name: Enter Craft env
-        run: |
-          set -euxo pipefail
-          source "$CRAFT_PREFIX/craft/craftenv.sh"
-          craft --version
-          craft --search kstars | head -n 200
 
       - name: Build KStars from this repo checkout
         run: |
           set -euxo pipefail
           source "$CRAFT_PREFIX/craft/craftenv.sh"
 
-          # Find the blueprint name Craft knows for KStars (varies by blueprint tree)
+          # Pick the blueprint name Craft exposes
           if craft --search kstars | grep -qiE 'kde/education/kstars'; then
             PKG="kde/education/kstars"
           else
             PKG="kstars"
           fi
-          echo "Using Craft package: $PKG"
 
-          # Build *your fork* by overriding srcDir to the checked out workspace. :contentReference[oaicite:2]{index=2}
           craft --ignoreInstalled --options "$PKG.srcDir=$GITHUB_WORKSPACE" "$PKG"
 
       - name: Package DMG
@@ -81,23 +59,13 @@ jobs:
             PKG="kstars"
           fi
 
-          # Package using the same srcDir override. :contentReference[oaicite:3]{index=3}
           craft --options "$PKG.srcDir=$GITHUB_WORKSPACE" --package "$PKG"
 
       - name: Collect artifacts
         run: |
           set -euxo pipefail
           mkdir -p artifacts
-
-          # Craft macOS packaging drops DMGs into CraftRoot/tmp. :contentReference[oaicite:4]{index=4}
           find "$CRAFT_PREFIX/tmp" -maxdepth 2 -name "*.dmg" -print -exec cp -v {} artifacts/ \;
-
-          # Helpful debugging info
-          {
-            echo "CRAFT_PREFIX=$CRAFT_PREFIX"
-            echo "TMP=$CRAFT_PREFIX/tmp"
-            echo "BUILD=$CRAFT_PREFIX/build"
-          } > artifacts/build-info.txt
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
