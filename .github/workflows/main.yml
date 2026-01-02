@@ -9,6 +9,10 @@ jobs:
   build-macos-arm64:
     runs-on: macos-14
 
+    env:
+      # Let pip modify Homebrew's EXTERNALLY-MANAGED Python during Craft bootstrap
+      PIP_BREAK_SYSTEM_PACKAGES: "1"
+
     defaults:
       run:
         shell: bash
@@ -32,9 +36,7 @@ jobs:
       - name: Bootstrap KDE Craft (arm64, non-interactive)
         run: |
           curl -L https://raw.githubusercontent.com/KDE/craft/master/setup/CraftBootstrap.py -o setup.py
-          # Answers the interactive prompts:
-          # 1) target architecture: 1 = arm64
-          # 2) next prompt: accept default
+          # 1 = arm64, then accept default for the next prompt
           printf "1\n\n" | python3 setup.py --prefix "$CRAFT_ROOT"
 
       - name: Install dependencies (online)
