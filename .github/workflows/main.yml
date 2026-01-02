@@ -1,64 +1,106 @@
 name: Build KStars (macOS arm64)
 
 on:
-  workflow_dispatch:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
-  build-macos-arm64:
+  build:
     runs-on: macos-14
 
     env:
-      # Let pip modify Homebrew's EXTERNALLY-MANAGED Python during Craft bootstrap
-      PIP_BREAK_SYSTEM_PACKAGES: "1"
-
-    defaults:
-      run:
-        shell: bash
+      CRAFT_PREFIX: ${{ runner.temp }}/CraftRoot
+      CRAFT_BRANCH: master
 
     steps:
-      - name: Checkout
+      - name: Checkout (your fork)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          submodules: recursive
 
-      - name: Set Craft root
+      - name: Verify we are on Apple Silicon
         run: |
-          echo "CRAFT_ROOT=$RUNNER_TEMP/CraftRoot" >> "$GITHUB_ENV"
-
-      - name: Show runner info
-        run: |
+          set -euxo pipefail
           uname -m
-          sw_vers
-          echo "CRAFT_ROOT=$CRAFT_ROOT"
+          test "$(uname -m)" = "arm64"
 
-      - name: Bootstrap KDE Craft (arm64, non-interactive)
-        run: |
-          curl -L https://raw.githubusercontent.com/KDE/craft/master/setup/CraftBootstrap.py -o setup.py
-          # 1 = arm64, then accept default for the next prompt
-          printf "1\n\n" | python3 setup.py --prefix "$CRAFT_ROOT"
+      # Optional: cache Craft downloads (saves a lot of time on repeat runs)
+      - name: Cache Craft downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CRAFT_PREFIX }}/download
+          key: macos-arm64-craft-${{ env.CRAFT_BRANCH }}-download-v1
+          restore-keys: |
+            macos-arm64-craft-${{ env.CRAFT_BRANCH }}-download-
 
-      - name: Install dependencies (online)
+      - name: Bootstrap KDE Craft (select arm64)
         run: |
-          source "$CRAFT_ROOT/craft/craftenv.sh"
-          craft --install-deps kde/applications/kstars
+          set -euxo pipefail
+          mkdir -p "$CRAFT_PREFIX"
 
-      - name: Build KStars from this repo
+          curl -L "https://raw.githubusercontent.com/KDE/craft/${CRAFT_BRANCH}/setup/CraftBootstrap.py" -o setup.py
+
+          # CraftBootstrap prompts on macOS for target architecture:
+          #   [0] x86_64, [1] arm64  (default is x86_64)
+          # We choose "1" (arm64), then accept defaults for later prompts. :contentReference[oaicite:1]{index=1}
+          printf "1\n\n" | python3 setup.py --prefix "$CRAFT_PREFIX" --branch "$CRAFT_BRANCH"
+
+      - name: Enter Craft env
         run: |
-          source "$CRAFT_ROOT/craft/craftenv.sh"
-          craft --src-dir "$GITHUB_WORKSPACE" --compile --install --qmerge kde/applications/kstars
+          set -euxo pipefail
+          source "$CRAFT_PREFIX/craft/craftenv.sh"
+          craft --version
+          craft --search kstars | head -n 200
+
+      - name: Build KStars from this repo checkout
+        run: |
+          set -euxo pipefail
+          source "$CRAFT_PREFIX/craft/craftenv.sh"
+
+          # Find the blueprint name Craft knows for KStars (varies by blueprint tree)
+          if craft --search kstars | grep -qiE 'kde/education/kstars'; then
+            PKG="kde/education/kstars"
+          else
+            PKG="kstars"
+          fi
+          echo "Using Craft package: $PKG"
+
+          # Build *your fork* by overriding srcDir to the checked out workspace. :contentReference[oaicite:2]{index=2}
+          craft --ignoreInstalled --options "$PKG.srcDir=$GITHUB_WORKSPACE" "$PKG"
 
       - name: Package DMG
         run: |
-          source "$CRAFT_ROOT/craft/craftenv.sh"
-          craft --src-dir "$GITHUB_WORKSPACE" --package kde/applications/kstars
-          ls -lah "$CRAFT_ROOT/tmp"
-          find "$CRAFT_ROOT/tmp" -maxdepth 1 -name "*.dmg" -print
+          set -euxo pipefail
+          source "$CRAFT_PREFIX/craft/craftenv.sh"
 
-      - name: Upload DMG
+          if craft --search kstars | grep -qiE 'kde/education/kstars'; then
+            PKG="kde/education/kstars"
+          else
+            PKG="kstars"
+          fi
+
+          # Package using the same srcDir override. :contentReference[oaicite:3]{index=3}
+          craft --options "$PKG.srcDir=$GITHUB_WORKSPACE" --package "$PKG"
+
+      - name: Collect artifacts
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts
+
+          # Craft macOS packaging drops DMGs into CraftRoot/tmp. :contentReference[oaicite:4]{index=4}
+          find "$CRAFT_PREFIX/tmp" -maxdepth 2 -name "*.dmg" -print -exec cp -v {} artifacts/ \;
+
+          # Helpful debugging info
+          {
+            echo "CRAFT_PREFIX=$CRAFT_PREFIX"
+            echo "TMP=$CRAFT_PREFIX/tmp"
+            echo "BUILD=$CRAFT_PREFIX/build"
+          } > artifacts/build-info.txt
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: kstars-macos-arm64-dmg
-          path: ${{ env.CRAFT_ROOT }}/tmp/*.dmg
-          if-no-files-found: error
+          name: kstars-macos-arm64
+          path: artifacts
