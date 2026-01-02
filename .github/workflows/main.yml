@@ -1,0 +1,58 @@
+name: Build KStars (macOS arm64)
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+jobs:
+  build-macos-arm64:
+    runs-on: macos-14   # Apple Silicon (arm64)
+    env:
+      CRAFT_ROOT: ${{ runner.temp }}/CraftRoot
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show runner info
+        run: |
+          uname -m
+          sw_vers
+
+      - name: Bootstrap KDE Craft
+        run: |
+          # KDE Craft bootstrap (same idea as KDE's macOS instructions)
+          curl -L https://raw.githubusercontent.com/KDE/craft/master/setup/CraftBootstrap.py -o setup.py
+          python3 setup.py --prefix "$CRAFT_ROOT"
+        # Craft bootstrap on macOS is documented by KDE
+        # (requires Python + Xcode CLT, which runners already have) :contentReference[oaicite:2]{index=2}
+
+      - name: Install dependencies (online)
+        run: |
+          source "$CRAFT_ROOT/craft/craftenv.sh"
+          craft --install-deps kde/applications/kstars
+        # Common craft commands like --install-deps / --package are documented here :contentReference[oaicite:3]{index=3}
+
+      - name: Build KStars from *this* repo (uses your fork checkout)
+        run: |
+          source "$CRAFT_ROOT/craft/craftenv.sh"
+          # --src-dir tells Craft to use the checked-out sources and enables offline mode :contentReference[oaicite:4]{index=4}
+          craft --src-dir "$GITHUB_WORKSPACE" --compile --install --qmerge kde/applications/kstars
+
+      - name: Package DMG
+        run: |
+          source "$CRAFT_ROOT/craft/craftenv.sh"
+          craft --src-dir "$GITHUB_WORKSPACE" --package kde/applications/kstars
+          ls -lah "$CRAFT_ROOT/tmp"
+          find "$CRAFT_ROOT/tmp" -maxdepth 1 -name "*.dmg" -print
+        # Craft typically outputs macOS DMGs into CraftRoot/tmp :contentReference[oaicite:5]{index=5}
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: kstars-macos-arm64-dmg
+          path: ${{ runner.temp }}/CraftRoot/tmp/*.dmg
+          if-no-files-found: error
