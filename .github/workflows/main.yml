@@ -2,137 +2,103 @@ name: Build KStars (macOS arm64)
 
 on:
   push:
+    branches: [ "main", "master" ]
   pull_request:
-  workflow_dispatch:
 
 jobs:
-  build:
+  build-macos-arm64:
     runs-on: macos-14
-    timeout-minutes: 180
-
-    defaults:
-      run:
-        shell: bash
 
     env:
-      CRAFT_PREFIX: ${{ github.workspace }}/.craftroot
-      CRAFT_DOWNLOAD_CACHE: ${{ github.workspace }}/.craft-download-cache
-      CRAFT_BRANCH: master
-      HOMEBREW_NO_AUTO_UPDATE: "1"
-      HOMEBREW_NO_ANALYTICS: "1"
+      CRAFT_ROOT: ${{ github.workspace }}/.craftroot
+      CRAFT_TARGET: kde/applications/kstars
 
     steps:
-      - name: Checkout (your fork)
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          submodules: recursive
+          fetch-tags: true
 
-      - name: Setup Python (toolcache)
-        uses: actions/setup-python@v6
+      # Critical: GitHub runners sometimes export Android env vars.
+      # If these exist, CraftBootstrap may detect "Android" and pull Android caches/tools.
+      - name: Ensure we are NOT in an Android environment
+        run: |
+          set -euo pipefail
+          unset ANDROID_SDK_ROOT ANDROID_HOME || true
+
+      # Use a non-Homebrew Python to avoid PEP 668 "externally-managed-environment".
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Create venv for Craft bootstrap
+      - name: Install host tools
         run: |
-          set -euxo pipefail
-          python -V
-          python -m venv "$GITHUB_WORKSPACE/.craft-bootstrap-venv"
-          echo "VENV_PY=$GITHUB_WORKSPACE/.craft-bootstrap-venv/bin/python" >> "$GITHUB_ENV"
-          "$GITHUB_WORKSPACE/.craft-bootstrap-venv/bin/python" -m pip install -U pip
+          set -euo pipefail
+          brew update
+          brew install p7zip ninja
 
-      - name: Cache Craft downloads
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.CRAFT_DOWNLOAD_CACHE }}
-          key: macos-arm64-craft-${{ env.CRAFT_BRANCH }}-download-v5
-          restore-keys: |
-            macos-arm64-craft-${{ env.CRAFT_BRANCH }}-download-
-
-      - name: Bootstrap KDE Craft (force macOS, select arm64)
+      - name: Bootstrap KDE Craft (Qt6, macOS clang arm64)
         run: |
-          set -euxo pipefail
+          set -euo pipefail
+          unset ANDROID_SDK_ROOT ANDROID_HOME || true
 
-          # Prevent CraftBootstrap from switching to Android mode on GitHub runners.
-          unset ANDROID_SDK_ROOT ANDROID_HOME
+          mkdir -p "$CRAFT_ROOT"
 
-          # Fresh prefix (won't wipe download cache since it's stored outside prefix)
-          rm -rf "$CRAFT_PREFIX"
-          mkdir -p "$CRAFT_PREFIX" "$CRAFT_DOWNLOAD_CACHE"
+          # Official bootstrap command from KDE docs uses this script.
+          curl -L https://raw.githubusercontent.com/KDE/craft/master/setup/CraftBootstrap.py \
+            -o "$RUNNER_TEMP/CraftBootstrap.py"
 
-          # Make Craft use the cached download directory
-          ln -sfn "$CRAFT_DOWNLOAD_CACHE" "$CRAFT_PREFIX/download"
+          # CraftBootstrap prompts on macOS for architecture:
+          #   [0] x86_64
+          #   [1] arm64
+          # Then asks about colored logs (default yes).
+          # We answer: "1" then blank (Enter).
+          printf "1\n\n" | python "$RUNNER_TEMP/CraftBootstrap.py" --prefix "$CRAFT_ROOT" --branch master
 
-          curl -L "https://raw.githubusercontent.com/KDE/craft/${CRAFT_BRANCH}/setup/CraftBootstrap.py" -o setup.py
-
-          # macOS prompt: [0] x86_64, [1] arm64 -> choose 1, then accept defaults.
-          printf "1\n\n" | "$VENV_PY" setup.py --prefix "$CRAFT_PREFIX" --branch "$CRAFT_BRANCH"
-
-      - name: Sanity check Craft configuration (macOS ABI + non-Homebrew Python)
+      - name: Show Craft info
+        shell: bash
         run: |
-          set -euxo pipefail
-          SETTINGS="$CRAFT_PREFIX/etc/CraftSettings.ini"
-          test -f "$SETTINGS"
+          set -euo pipefail
+          unset ANDROID_SDK_ROOT ANDROID_HOME || true
 
-          echo "---- ABI ----"
-          grep -E '^\s*ABI\s*=' "$SETTINGS" || true
-          if ! grep -qE '^\s*ABI\s*=\s*macos-' "$SETTINGS"; then
-            echo "ERROR: Craft ABI is not macOS."
-            exit 1
-          fi
-
-          echo "---- Paths/Python ----"
-          awk 'BEGIN{p=0} /^\[Paths\]/{p=1} p{print} /^\[/{if(p && $0!="[Paths]") exit}' "$SETTINGS" || true
-          if grep -qE '^\s*Python\s*=\s*/opt/homebrew' "$SETTINGS"; then
-            echo "ERROR: Craft is configured to use Homebrew Python (externally-managed)."
-            exit 1
-          fi
-
-      - name: Build KStars from this repo checkout
-        run: |
-          set -euxo pipefail
-          unset ANDROID_SDK_ROOT ANDROID_HOME
-
-          # craftenv.sh is not nounset-safe
+          # craftenv.sh is not "set -u" clean; disable nounset just for sourcing.
           set +u
-          source "$CRAFT_PREFIX/craft/craftenv.sh"
+          source "$CRAFT_ROOT/craft/craftenv.sh"
           set -u
 
-          if craft --search kstars | grep -qiE 'kde/education/kstars'; then
-            PKG="kde/education/kstars"
-          else
-            PKG="kstars"
-          fi
-          echo "Using Craft package: $PKG"
+          craft --version
+          craft --print-settings || true
 
-          craft --ignoreInstalled --options "$PKG.srcDir=$GITHUB_WORKSPACE" "$PKG"
-
-      - name: Package DMG
+      - name: Build KStars from this fork (Craft)
+        shell: bash
         run: |
-          set -euxo pipefail
-          unset ANDROID_SDK_ROOT ANDROID_HOME
+          set -euo pipefail
+          unset ANDROID_SDK_ROOT ANDROID_HOME || true
 
           set +u
-          source "$CRAFT_PREFIX/craft/craftenv.sh"
+          source "$CRAFT_ROOT/craft/craftenv.sh"
           set -u
 
-          if craft --search kstars | grep -qiE 'kde/education/kstars'; then
-            PKG="kde/education/kstars"
-          else
-            PKG="kstars"
-          fi
+          # Use local checkout as the source dir.
+          # Disable libftdi tests to avoid Boost unit_test_framework config failures.
+          craft -v --options \
+            "kde/applications/kstars.srcDir=$GITHUB_WORKSPACE" \
+            "libs/libftdi.buildTests=False" \
+            "libs/libftdi.args=-DBUILD_TESTS=OFF -DBUILD_TESTING=OFF" \
+            "$CRAFT_TARGET"
 
-          craft --options "$PKG.srcDir=$GITHUB_WORKSPACE" --package "$PKG"
-
-      - name: Collect artifacts
+      - name: Locate app bundle
+        shell: bash
         run: |
-          set -euxo pipefail
-          mkdir -p artifacts
-          find "$CRAFT_PREFIX/tmp" -maxdepth 2 -name "*.dmg" -print -exec cp -v {} artifacts/ \; || true
-          cp -v "$CRAFT_PREFIX/etc/CraftSettings.ini" artifacts/ || true
+          set -euo pipefail
+          echo "Looking for KStars app bundle under: $CRAFT_ROOT/Applications"
+          find "$CRAFT_ROOT/Applications" -maxdepth 4 -name "KStars*.app" -print || true
 
-      - name: Upload artifacts
+      - name: Upload KStars.app artifact
         uses: actions/upload-artifact@v4
         with:
           name: kstars-macos-arm64
-          path: artifacts
+          path: |
+            .craftroot/Applications/KDE/KStars*.app
